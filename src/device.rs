@@ -260,15 +260,24 @@ impl Calc {
         result
     }
 
-    /// Download a file from the calculator.
-    pub fn download(&mut self, path: &str) -> R<Vec<u8>> {
+    /// Download a file from the calculator, reporting `(received, total)` after
+    /// each chunk.
+    pub fn download_with_progress(
+        &mut self,
+        path: &str,
+        progress: &mut dyn FnMut(usize, usize),
+    ) -> R<Vec<u8>> {
         self.service_connect(SID_FILE)?;
-        let result = self.download_inner(path);
+        let result = self.download_inner(path, progress);
         let _ = self.service_disconnect();
         result
     }
 
-    fn download_inner(&mut self, path: &str) -> R<Vec<u8>> {
+    fn download_inner(
+        &mut self,
+        path: &str,
+        progress: &mut dyn FnMut(usize, usize),
+    ) -> R<Vec<u8>> {
         let mut d = vec![0x07, 0x01];
         push_padded_string(&mut d, path);
         self.data_write(&d)?;
@@ -290,6 +299,7 @@ impl Calc {
         self.send_sync(&mut go)?;
 
         let chunk = self.max_data() - 1;
+        let total = remaining;
         let mut out = Vec::with_capacity(remaining);
         while remaining > 0 {
             let want = chunk.min(remaining);
@@ -300,6 +310,7 @@ impl Calc {
             let payload = &data.data[1..];
             out.extend_from_slice(payload);
             remaining -= payload.len();
+            progress(total - remaining, total);
         }
 
         // Acknowledge completion.
@@ -309,15 +320,26 @@ impl Calc {
         Ok(out)
     }
 
-    /// Upload a file to the calculator.
-    pub fn upload(&mut self, path: &str, data: &[u8]) -> R<()> {
+    /// Upload a file to the calculator, reporting `(sent, total)` after each
+    /// chunk.
+    pub fn upload_with_progress(
+        &mut self,
+        path: &str,
+        data: &[u8],
+        progress: &mut dyn FnMut(usize, usize),
+    ) -> R<()> {
         self.service_connect(SID_FILE)?;
-        let result = self.upload_inner(path, data);
+        let result = self.upload_inner(path, data, progress);
         let _ = self.service_disconnect();
         result
     }
 
-    fn upload_inner(&mut self, path: &str, data: &[u8]) -> R<()> {
+    fn upload_inner(
+        &mut self,
+        path: &str,
+        data: &[u8],
+        progress: &mut dyn FnMut(usize, usize),
+    ) -> R<()> {
         // 0x03 0x01 path size:u32
         let mut d = vec![0x03, 0x01];
         push_padded_string(&mut d, path);
@@ -343,12 +365,16 @@ impl Calc {
         }
 
         let chunk = self.max_data() - 1;
+        let total = data.len();
+        let mut sent = 0;
         for part in data.chunks(chunk) {
             let mut p = self.packet();
             p.data = Vec::with_capacity(part.len() + 1);
             p.data.push(0x05);
             p.data.extend_from_slice(part);
             self.send_sync(&mut p)?;
+            sent += part.len();
+            progress(sent, total);
         }
 
         let resp = self.data_read(254)?;

@@ -117,10 +117,13 @@ pub enum Done {
 }
 
 /// One request to the calculator thread, with a private reply channel so a
-/// caller can block on exactly its own result.
+/// caller can block on exactly its own result. `progress` is optional and only
+/// set for jobs that report byte progress (uploads/downloads); it carries
+/// `(done, total)`.
 pub struct Request {
     pub job: Job,
     pub reply: Sender<Done>,
+    pub progress: Option<Sender<(usize, usize)>>,
 }
 
 /// A handle that can drive the calculator. Shared by the GUI and the MCP server.
@@ -133,16 +136,21 @@ impl Session {
     /// Queue a job and wait for its result.
     pub fn call(&self, job: Job) -> Done {
         let (tx, rx) = channel();
-        if self.tx.send(Request { job, reply: tx }).is_err() {
+        if self.tx.send(Request { job, reply: tx, progress: None }).is_err() {
             return Done::Err("calculator worker is gone".into());
         }
         rx.recv().unwrap_or_else(|_| Done::Err("worker dropped the request".into()))
     }
 
     /// Queue a job whose result is delivered to `reply` (used by the GUI so it
-    /// can stay non-blocking).
-    pub fn tx_send(&self, job: Job, reply: Sender<Done>) -> Result<(), ()> {
-        self.tx.send(Request { job, reply }).map_err(|_| ())
+    /// can stay non-blocking). `progress` receives `(done, total)` per chunk.
+    pub fn tx_send(
+        &self,
+        job: Job,
+        reply: Sender<Done>,
+        progress: Option<Sender<(usize, usize)>>,
+    ) -> Result<(), ()> {
+        self.tx.send(Request { job, reply, progress }).map_err(|_| ())
     }
 }
 
@@ -162,6 +170,19 @@ struct App {
     new_folder: String,
     device_name: String,
     busy: bool,
+    /// Pending upload that needs the user to accept the forced `.tns` rename:
+    /// `(local source, original name, device name)`.
+    pending_upload: Option<(std::path::PathBuf, String, String)>,
+    /// Live byte progress of the upload/download in flight, if any.
+    transfer: Option<Transfer>,
+    notify_rx: Option<Receiver<(usize, usize)>>,
+}
+
+/// Progress of a single file transfer, shown in the top bar.
+struct Transfer {
+    label: String,
+    done: usize,
+    total: usize,
 }
 
 impl App {
@@ -181,17 +202,46 @@ impl App {
             new_folder: String::new(),
             device_name: String::new(),
             busy: false,
+            pending_upload: None,
+            transfer: None,
+            notify_rx: None,
         }
     }
 
     fn send(&mut self, job: Job) {
         self.busy = true;
         let reply = self.reply_tx.clone();
-        let _ = self.session.tx_send(job, reply);
+        let _ = self.session.tx_send(job, reply, None);
+    }
+
+    /// Send a job that reports byte progress, tracked in `self.transfer`.
+    fn send_with_progress(&mut self, job: Job, label: String, total: usize) {
+        self.busy = true;
+        let reply = self.reply_tx.clone();
+        let (ptx, prx) = channel::<(usize, usize)>();
+        self.notify_rx = Some(prx);
+        self.transfer = Some(Transfer { label, done: 0, total });
+        let _ = self.session.tx_send(job, reply, Some(ptx));
+    }
+
+    /// Drain byte-progress messages into the transfer indicator.
+    fn pump_progress(&mut self) {
+        if let Some(rx) = &self.notify_rx {
+            while let Ok((done, total)) = rx.try_recv() {
+                if let Some(t) = &mut self.transfer {
+                    t.done = done;
+                    t.total = total;
+                }
+            }
+        }
     }
 
     fn pump(&mut self) {
+        self.pump_progress();
         while let Ok(msg) = self.done.try_recv() {
+            // A finished job ends any transfer indicator it was driving.
+            self.transfer = None;
+            self.notify_rx = None;
             self.busy = false;
             match msg {
                 Done::Connected { name, cx2 } => {
@@ -254,6 +304,16 @@ impl eframe::App for App {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
 
+        // Dim the app while the rename prompt is up, so it reads as modal.
+        if self.pending_upload.is_some() {
+            let screen = ctx.screen_rect();
+            ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Background,
+                egui::Id::new("rename_prompt_dim"),
+            ))
+            .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(120));
+        }
+
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui
@@ -306,7 +366,10 @@ impl eframe::App for App {
                     // The first child follows it directly (that slash already
                     // separates them); later children get their own separator.
                     if idx == 0 {
-                        if nav_enabled && ui.add(egui::Label::new("/").sense(egui::Sense::click())).clicked() {
+                        // Always draw the root crumb, even while busy: an empty
+                        // row would collapse and shift everything below it.
+                        let resp = ui.add(egui::Label::new("/").sense(egui::Sense::click()));
+                        if nav_enabled && resp.clicked() {
                             self.send(Job::List(path));
                         }
                         continue;
@@ -330,12 +393,7 @@ impl eframe::App for App {
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let mut editable = self.cwd.clone();
-                    if ui.add_enabled(nav_enabled, egui::TextEdit::singleline(&mut editable).desired_width(200.0)).lost_focus()
-                        && editable != self.cwd
-                    {
-                        self.send(Job::List(editable));
-                    }
+                    self.show_transfer(ui);
                 });
             });
         });
@@ -360,9 +418,9 @@ impl eframe::App for App {
                 }
             }
             if ui.add_enabled(enabled && single.is_some(), egui::Button::new("Download…")).clicked() {
-                let i = single.unwrap();
-                let path = self.path_of(&self.entries[i].name);
-                self.send(Job::Download(path));
+                if let Some(i) = single {
+                    self.download_index(i);
+                }
             }
             if ui.add_enabled(enabled && single.is_some(), egui::Button::new("File info")).clicked() {
                 let i = single.unwrap();
@@ -462,10 +520,11 @@ impl eframe::App for App {
                 {
                     let painter = ui.painter();
                     let strong = ui.visuals().strong_text_color();
-                    for (x, title) in cols.iter().zip(["Name", "Type", "Size", "Date"]) {
+                    for (i, (x, title)) in cols.iter().zip(["Name", "Type", "Size", "Date"]).enumerate() {
+                        let (align, at) = cell_anchor(i, hrect.left() + x);
                         painter.text(
-                            egui::pos2(hrect.left() + x, hrect.center().y),
-                            egui::Align2::LEFT_CENTER,
+                            egui::pos2(at, hrect.center().y),
+                            align,
                             title,
                             font.clone(),
                             strong,
@@ -510,10 +569,22 @@ impl eframe::App for App {
                     ];
                     {
                         let painter = ui.painter();
-                        for (x, s) in cols.iter().zip(cells.iter()) {
+                        // The name column has no fixed width, so stop it before
+                        // the right-aligned columns instead of overprinting them.
+                        let name_limit = rect.left() + cols[1] - NAME_GAP;
+                        for (i, (x, s)) in cols.iter().zip(cells.iter()).enumerate() {
+                            let (align, at) = cell_anchor(i, rect.left() + x);
+                            let painter = if i == 0 {
+                                painter.with_clip_rect(egui::Rect::from_min_max(
+                                    rect.min,
+                                    egui::pos2(name_limit, rect.max.y),
+                                ))
+                            } else {
+                                painter.clone()
+                            };
                             painter.text(
-                                egui::pos2(rect.left() + x, rect.center().y),
-                                egui::Align2::LEFT_CENTER,
+                                egui::pos2(at, rect.center().y),
+                                align,
                                 s,
                                 font.clone(),
                                 text_color,
@@ -537,6 +608,7 @@ impl eframe::App for App {
             });
         });
 
+        self.show_rename_prompt(ctx);
     }
 }
 
@@ -565,6 +637,7 @@ impl App {
     }
 
     /// Read a local file and queue it for upload into the current directory.
+    /// Non-`.tns` files need the user to accept the rename first.
     fn queue_upload(&mut self, src: std::path::PathBuf) {
         let name = src
             .file_name()
@@ -573,12 +646,100 @@ impl App {
         if name.is_empty() {
             return;
         }
+        let (dst_name, renamed) = upload_target(&name);
+        if renamed {
+            self.pending_upload = Some((src, name, dst_name));
+        } else {
+            self.start_upload(src, dst_name);
+        }
+    }
+
+    /// Read a file from disk and hand it to the calculator thread.
+    fn start_upload(&mut self, src: std::path::PathBuf, dst_name: String) {
         match std::fs::read(&src) {
             Ok(data) => {
-                let dst = self.path_of(&name);
-                self.send(Job::Upload(dst, data));
+                let dst = self.path_of(&dst_name);
+                let total = data.len();
+                let label = format!("Uploading {}", file_label(&dst_name));
+                self.send_with_progress(Job::Upload(dst, data), label, total);
             }
             Err(e) => self.status = format!("Read failed: {e}"),
+        }
+    }
+
+    /// Progress of the transfer in flight, in the top-right corner.
+    fn show_transfer(&self, ui: &mut egui::Ui) {
+        let Some(t) = &self.transfer else { return };
+        // Right-to-left layout, so add the bar first and the text left of it.
+        // Match the rest of the UI: egui defaults the bar to a pill
+        // (rounding = height / 2), while widgets here round by 2.
+        let rounding = ui.style().visuals.widgets.inactive.rounding;
+        ui.add(
+            egui::ProgressBar::new(if t.total == 0 {
+                0.0
+            } else {
+                (t.done as f32 / t.total as f32).clamp(0.0, 1.0)
+            })
+            .rounding(rounding)
+            .desired_width(160.0)
+            .show_percentage(),
+        );
+        ui.label(format!(
+            "{} ({}/{})",
+            t.label,
+            human_size(t.done),
+            human_size(t.total)
+        ));
+    }
+
+    /// Modal asking the user to accept the forced `.tns` rename before upload.
+    fn show_rename_prompt(&mut self, ctx: &egui::Context) {
+        let Some((src, original, renamed)) = self.pending_upload.clone() else {
+            return;
+        };
+        let mut answer: Option<bool> = None;
+        // Escape cancels, like any other dialog.
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            answer = Some(false);
+        }
+        egui::Window::new("Rename before upload")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_max_width(420.0);
+                ui.label(format!(
+                    "The calculator only accepts files whose name ends in .tns, so \"{original}\" \
+                     will be uploaded as \"{renamed}\"."
+                ));
+                ui.add_space(6.0);
+                ui.label(
+                    "The file's contents are stored unchanged. Whether it opens on the \
+                     calculator depends on the file type: a viewer such as nPDF is needed for \
+                     PDFs, comic archives and similar files. Without one, the file may not \
+                     open on the calculator, but you can always download it back with this \
+                     app.",
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Upload").clicked() {
+                        answer = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        answer = Some(false);
+                    }
+                });
+            });
+        match answer {
+            Some(true) => {
+                self.pending_upload = None;
+                self.start_upload(src, renamed);
+            }
+            Some(false) => {
+                self.pending_upload = None;
+                self.status = "Upload cancelled.".into();
+            }
+            None => {}
         }
     }
 
@@ -593,15 +754,26 @@ impl App {
         if item.is_dir {
             self.send(Job::List(path));
         } else {
-            self.send(Job::Download(path));
+            self.download_index(i);
         }
+    }
+
+    /// Download a file entry, showing byte progress.
+    fn download_index(&mut self, i: usize) {
+        let Some(item) = self.entries.get(i).cloned() else { return };
+        if item.is_dir {
+            return;
+        }
+        let path = self.path_of(&item.name);
+        let label = format!("Downloading {}", item.name);
+        self.send_with_progress(Job::Download(path), label, item.size as usize);
     }
 }
 
 /// The calculator thread: owns the connection and executes jobs serially.
 fn worker(reqs: Receiver<Request>) {
     let mut calc: Option<Calc> = None;
-    while let Ok(Request { job, reply }) = reqs.recv() {
+    while let Ok(Request { job, reply, progress }) = reqs.recv() {
         let out = match job {
             Job::Connect => match Calc::connect() {
                 Ok(mut c) => {
@@ -657,17 +829,32 @@ fn worker(reqs: Receiver<Request>) {
                             Done::Err(format!("delete failed: {}", failed.join("; ")))
                         }
                     }
-                    Job::Download(path) => match c.download(&path) {
-                        Ok(data) => {
-                            let name = path.rsplit('/').next().unwrap_or("file").to_string();
-                            Done::Downloaded { name, data }
+                    Job::Download(path) => {
+                        let mut emit = |done: usize, total: usize| {
+                            if let Some(tx) = &progress {
+                                let _ = tx.send((done, total));
+                            }
+                        };
+                        match c.download_with_progress(&path, &mut emit) {
+                            Ok(data) => {
+                                let name =
+                                    path.rsplit('/').next().unwrap_or("file").to_string();
+                                Done::Downloaded { name, data }
+                            }
+                            Err(e) => Done::Err(format!("download failed: {e}")),
                         }
-                        Err(e) => Done::Err(format!("download failed: {e}")),
-                    },
-                    Job::Upload(path, data) => match c.upload(&path, &data) {
-                        Ok(_) => Done::Ok(format!("Uploaded {} bytes to {path}", data.len())),
-                        Err(e) => Done::Err(format!("upload failed: {e}")),
-                    },
+                    }
+                    Job::Upload(path, data) => {
+                        let mut emit = |done: usize, total: usize| {
+                            if let Some(tx) = &progress {
+                                let _ = tx.send((done, total));
+                            }
+                        };
+                        match c.upload_with_progress(&path, &data, &mut emit) {
+                            Ok(_) => Done::Ok(format!("Uploaded {} bytes to {path}", data.len())),
+                            Err(e) => Done::Err(format!("upload failed: {e}")),
+                        }
+                    }
                     Job::Info(path) => match c.attributes(&path) {
                         Ok(a) => Done::Info(format!(
                             "{}: {} | size {} | date {}",
@@ -739,13 +926,32 @@ fn breadcrumbs(path: &str) -> Vec<(String, String)> {
     out
 }
 
+/// Gap kept between the name column and the right-aligned columns beside it.
+const NAME_GAP: f32 = 12.0;
+
 /// X offsets for the Name/Type/Size/Date columns.
+/// Each entry is the column's *right* edge except the first (Name), which is a
+/// left offset: Name is left-aligned, the rest are right-aligned against it.
 fn column_x(total_width: f32) -> [f32; 4] {
     let pad = 6.0;
-    let name = (total_width * 0.5).max(120.0);
-    let type_w = 60.0;
     let size_w = 90.0;
-    [pad, name, name + type_w, name + type_w + size_w]
+    let date_w = 110.0;
+    // Right edges, measured from the right of the row.
+    let date_right = total_width - pad;
+    let size_right = date_right - date_w;
+    let type_right = size_right - size_w;
+    let name_left = pad;
+    [name_left, type_right, size_right, date_right]
+}
+
+/// Alignment and absolute x for a cell: Name is left-aligned, the rest are
+/// right-aligned against their column's right edge.
+fn cell_anchor(col: usize, x: f32) -> (egui::Align2, f32) {
+    if col == 0 {
+        (egui::Align2::LEFT_CENTER, x)
+    } else {
+        (egui::Align2::RIGHT_CENTER, x)
+    }
 }
 
 /// Compute the new selection for a click, mirroring standard list-view rules.
@@ -796,6 +1002,18 @@ fn duplicate_name(name: &str, existing: &[DirItem]) -> String {
     format!("{stem} (copy){ext}")
 }
 
+/// Decide the device name for a local file being uploaded.
+///
+/// The calculator only accepts documents whose name ends in `.tns` (lowercase);
+/// it does not inspect the contents. So anything else is given a `.<ext>.tns`
+/// name, keeping the original extension visible. Returns `(name, renamed)`.
+fn upload_target(name: &str) -> (String, bool) {
+    if name.ends_with(".tns") {
+        return (name.to_string(), false);
+    }
+    (format!("{name}.tns"), true)
+}
+
 /// Decide the new file name for a rename.
 ///
 /// Users typically type a bare name, so if they drop the extension we keep the
@@ -813,6 +1031,27 @@ fn rename_target(old: &str, typed: &str) -> String {
         Some(i) if i > 0 => format!("{typed}{}", &old[i..]),
         _ => typed.to_string(),
     }
+}
+
+/// Bytes as a short human-readable size, for the transfer indicator.
+fn human_size(n: usize) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut v = n as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
+}
+
+/// The part of a device path shown in the transfer label.
+fn file_label(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or(path).to_string()
 }
 
 /// The calculator reports a packed date; render it as YYYY-MM-DD when plausible.
@@ -840,6 +1079,31 @@ mod tests {
         assert_eq!(parent_path("/docs"), "/");
         assert_eq!(parent_path("/docs/a"), "/docs");
         assert_eq!(parent_path("/docs/a/"), "/docs");
+    }
+
+    #[test]
+    fn upload_renames_non_tns_to_double_extension() {
+        // Already a document: untouched.
+        assert_eq!(upload_target("hw.tns"), ("hw.tns".into(), false));
+        // Anything else keeps its own extension, then gains .tns.
+        assert_eq!(upload_target("a.pdf"), ("a.pdf.tns".into(), true));
+        assert_eq!(upload_target("doc.cbz"), ("doc.cbz.tns".into(), true));
+        assert_eq!(upload_target("README"), ("README.tns".into(), true));
+        // Only a lowercase trailing .tns counts; the device is case-sensitive.
+        assert_eq!(upload_target("a.TNS"), ("a.TNS.tns".into(), true));
+        // A .tns that already has a prefix is still a document.
+        assert_eq!(upload_target("a.pdf.tns"), ("a.pdf.tns".into(), false));
+    }
+
+    #[test]
+    fn human_size_and_label() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(1024), "1.0 KB");
+        assert_eq!(human_size(1536), "1.5 KB");
+        assert_eq!(human_size(1024 * 1024), "1.0 MB");
+        assert_eq!(file_label("/docs/a.tns"), "a.tns");
+        assert_eq!(file_label("a.tns"), "a.tns");
     }
 
     #[test]

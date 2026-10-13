@@ -36,6 +36,10 @@ Build requirements: a Rust toolchain and a C compiler plus libusb headers
 (`libusb-1.0-0-dev` on Debian/Ubuntu, `libusb-devel` on Fedora,
 `libusb` on Arch/macOS via Homebrew).
 
+At runtime on Linux, `zenity` must be installed: `rfd` uses it for the file
+pickers. Without it the pickers are silently reported as cancelled, so choosing
+a file to upload or download appears to do nothing.
+
 ### Prebuilt AppImage
 
 Every commit on `master` is built into a standalone x86_64 AppImage and
