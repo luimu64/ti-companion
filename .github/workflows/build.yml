@@ -91,8 +91,10 @@ jobs:
         run: |
           set -euo pipefail
           # --appimage-extract-and-run avoids needing FUSE inside the runner.
-          ARCH=x86_64 ./appimagetool --appimage-extract-and-run AppDir \
-            "TI-Nspire-Companion-${GITHUB_SHA::7}-x86_64.AppImage"
+          # appimagetool normalises the output name, so keep it simple.
+          OUTFILE="TI-Nspire-Companion-x86_64.AppImage"
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run AppDir "$OUTFILE"
+          ls -l "$OUTFILE"
 
       - name: Upload AppImage
         uses: actions/upload-artifact@v4
