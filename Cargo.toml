@@ -1,0 +1,26 @@
+[package]
+name = "ti-companion"
+version = "0.1.0"
+edition = "2021"
+description = "Cross-platform file manager for TI-Nspire calculators over USB"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/luimu64/ti-companion"
+keywords = ["ti-nspire", "calculator", "usb", "file-manager", "gui"]
+categories = ["command-line-utilities", "gui"]
+exclude = ["/.github", "/packaging"]
+
+[dependencies]
+rusb = "0.9"
+eframe = "0.29"
+egui = "0.29"
+rfd = "0.15"
+rmcp = { version = "3.5.1", features = ["server", "transport-io"] }
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "io-std"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true

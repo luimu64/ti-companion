@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=TI-Nspire Companion
+Comment=File manager for TI-Nspire calculators over USB
+Exec=ti-companion
+Icon=ti-companion
+Categories=Utility;FileTools;
+Terminal=false

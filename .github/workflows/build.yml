@@ -1,0 +1,103 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY: ti-companion
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libusb-1.0-0-dev libxkbcommon-dev libgl1-mesa-dev
+      - name: Build
+        run: cargo build --release --verbose
+      - name: Test
+        run: cargo test --release --verbose
+
+  appimage:
+    name: appimage
+    runs-on: ubuntu-22.04
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libusb-1.0-0-dev libxkbcommon-dev libgl1-mesa-dev libfuse2 librsvg2-dev
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Build AppDir
+        run: |
+          set -euo pipefail
+          APPDIR="$PWD/AppDir"
+          rm -rf "$APPDIR"
+          mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib"
+
+          install -Dm755 "target/release/$BINARY" "$APPDIR/usr/bin/$BINARY"
+          install -Dm644 packaging/ti-companion.desktop "$APPDIR/usr/share/applications/ti-companion.desktop"
+
+          for size in 16 32 48 64 128 256; do
+            install -Dm644 packaging/ti-companion.png \
+              "$APPDIR/usr/share/icons/hicolor/${size}x${size}/apps/ti-companion.png"
+          done
+
+          # Top-level entries required by the AppImage spec.
+          install -Dm644 packaging/ti-companion.desktop "$APPDIR/ti-companion.desktop"
+          install -Dm644 packaging/ti-companion.png "$APPDIR/ti-companion.png"
+          install -Dm644 packaging/ti-companion.png "$APPDIR/.DirIcon"
+
+          # Bundle the shared libraries the binary needs but that are not
+          # guaranteed on every target distro (libusb is the important one).
+          ldd "target/release/$BINARY" | awk '/=>/ {print $3}' | grep -E '/libusb-1\.0\.so' \
+            | xargs -r -I{} cp -Lv {} "$APPDIR/usr/lib/"
+
+          printf '%s\n' \
+            '#!/bin/sh' \
+            'HERE="$(dirname "$(readlink -f "$0")")"' \
+            'export LD_LIBRARY_PATH="$HERE/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"' \
+            'exec "$HERE/usr/bin/ti-companion" "$@"' \
+            > "$APPDIR/AppRun"
+          chmod +x "$APPDIR/AppRun"
+
+      - name: Fetch appimagetool
+        run: |
+          set -euo pipefail
+          curl -fsSL -o appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+
+      - name: Package AppImage
+        run: |
+          set -euo pipefail
+          # --appimage-extract-and-run avoids needing FUSE inside the runner.
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run AppDir \
+            "TI-Nspire-Companion-${GITHUB_SHA::7}-x86_64.AppImage"
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: TI-Nspire-Companion-${{ github.sha }}-x86_64.AppImage
+          path: ./*.AppImage
+          if-no-files-found: error
+          retention-days: 90
