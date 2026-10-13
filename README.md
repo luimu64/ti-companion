@@ -38,15 +38,24 @@ Build requirements: a Rust toolchain and a C compiler plus libusb headers
 
 ### Prebuilt AppImage
 
-Every commit is built into a standalone x86_64 AppImage by the
-[`build` workflow](.github/workflows/build.yml). Grab the artifact named
-`TI-Nspire-Companion-<sha>-x86_64.AppImage` from the workflow run for the commit
-you want, then:
+Every commit on `master` is built into a standalone x86_64 AppImage and
+published to the rolling [`latest` release](../../releases/tag/latest). That
+tag always points at the newest build, so this URL is stable:
 
 ```sh
-chmod +x TI-Nspire-Companion-*-x86_64.AppImage
-./TI-Nspire-Companion-*-x86_64.AppImage
+# The asset filename includes the build date and commit, so list before fetching:
+curl -fsS https://api.github.com/repos/luimu64/ti-companion/releases/tags/latest \
+  | grep browser_download_url
 ```
+
+Or just open the [releases page](../../releases) and download the asset. The
+rolling tag is `latest`, so
+`https://github.com/luimu64/ti-companion/releases/tag/latest` always shows the
+newest build.
+
+Each commit also keeps a per-commit artifact
+(`TI-Nspire-Companion-<sha>-x86_64.AppImage`) on its workflow run for 90 days;
+that one downloads as a zip.
 
 The AppImage bundles libusb, so no system packages are required beyond the usual
 desktop graphics stack.
