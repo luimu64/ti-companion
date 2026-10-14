@@ -116,22 +116,22 @@ impl CalcServer {
 
     #[tool(description = "Download a file from the calculator to a local path.")]
     fn download_file(&self, Parameters(DownloadArg { path, local_file }): Parameters<DownloadArg>) -> Result<String, String> {
-        match self.session.call(Job::Download(path.clone())) {
-            Done::Downloaded { data, .. } => {
-                std::fs::write(&local_file, &data).map_err(|e| format!("write {local_file}: {e}"))?;
-                Ok(format!("saved {} bytes to {local_file}", data.len()))
-            }
-            Done::Err(e) => err(e),
-            _ => err("unexpected reply to download_file"),
-        }
+        let data = self.fetch(&path)?;
+        std::fs::write(&local_file, &data).map_err(|e| format!("write {local_file}: {e}"))?;
+        Ok(format!("saved {} bytes to {local_file}", data.len()))
     }
 
     #[tool(description = "Read a file from the calculator and return its contents as base64.")]
     fn read_file(&self, Parameters(PathArg { path }): Parameters<PathArg>) -> Result<String, String> {
-        match self.session.call(Job::Download(path)) {
-            Done::Downloaded { data, .. } => Ok(base64(&data)),
-            Done::Err(e) => err(e),
-            _ => err("unexpected reply to read_file"),
+        Ok(base64(&self.fetch(&path)?))
+    }
+
+    /// Download one file, shared by `download_file` and `read_file`.
+    fn fetch(&self, path: &str) -> Result<Vec<u8>, String> {
+        match self.session.call(Job::Download(path.to_string())) {
+            Done::Downloaded { data, .. } => Ok(data),
+            Done::Err(e) => Err(e),
+            _ => Err("unexpected reply to download".into()),
         }
     }
 

@@ -155,7 +155,7 @@ pub fn data_checksum(data: &[u8]) -> u16 {
     for &b in data {
         let tmp1: u16 = ((b as u16) << 8) | (chksum >> 8);
         let c = chksum & 0xFF;
-        let tmp2: u16 = ((((c & 0xF) << 4) ^ c) << 8) & 0xFFFF;
+        let tmp2: u16 = (((c & 0xF) << 4) ^ c) << 8;
         let tmp3: u16 = tmp2 >> 5;
         let mut cs: u16 = tmp3 >> 7;
         cs ^= tmp1 ^ tmp2 ^ tmp3;

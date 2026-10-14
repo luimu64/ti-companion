@@ -291,6 +291,15 @@ impl Calc {
         }
         let mut remaining =
             u32::from_be_bytes([header[11], header[12], header[13], header[14]]) as usize;
+        // A garbled length must not turn into a multi-GB allocation. The largest
+        // real document is far below this; anything above is a bad response.
+        // shortcut: fixed 256 MB ceiling, raise it if the device ever holds more.
+        const MAX_DOWNLOAD: usize = 256 * 1024 * 1024;
+        if remaining > MAX_DOWNLOAD {
+            return Err(TransportError::Protocol(format!(
+                "implausible file size {remaining}"
+            )));
+        }
 
         // Tell the device we are ready to receive.
         let mut go = self.packet();
@@ -550,6 +559,17 @@ fn status_text(code: u8) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_text_maps_known_codes() {
+        assert_eq!(status_text(0), "ok");
+        assert!(status_text(1).contains("storage full"));
+        assert!(status_text(7).contains("bad path"));
+        assert!(status_text(8).contains("unsupported file type"));
+        // Unknown / out-of-table codes fall back, still naming the raw status.
+        assert!(status_text(200).contains("device error"));
+        assert!(status_text(200).contains("0xc8"));
+    }
 
     #[test]
     fn padded_string_roundtrip() {

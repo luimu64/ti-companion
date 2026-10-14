@@ -147,8 +147,8 @@ impl Session {
         job: Job,
         reply: Sender<Done>,
         progress: Option<Sender<(usize, usize)>>,
-    ) -> Result<(), ()> {
-        self.tx.send(Request { job, reply, progress }).map_err(|_| ())
+    ) -> bool {
+        self.tx.send(Request { job, reply, progress }).is_ok()
     }
 }
 
@@ -171,6 +171,8 @@ struct App {
     /// Pending upload that needs the user to accept the forced `.tns` rename:
     /// `(local source, original name, device name)`.
     pending_upload: Option<(std::path::PathBuf, String, String)>,
+    /// Paths awaiting the user's delete confirmation: `(path, is_dir)`.
+    pending_delete: Option<Vec<(String, bool)>>,
     /// Live byte progress of the upload/download in flight, if any.
     transfer: Option<Transfer>,
     notify_rx: Option<Receiver<(usize, usize)>>,
@@ -201,6 +203,7 @@ impl App {
             device_name: String::new(),
             busy: false,
             pending_upload: None,
+            pending_delete: None,
             transfer: None,
             notify_rx: None,
         }
@@ -209,7 +212,7 @@ impl App {
     fn send(&mut self, job: Job) {
         self.busy = true;
         let reply = self.reply_tx.clone();
-        if self.session.tx_send(job, reply, None).is_err() {
+        if !self.session.tx_send(job, reply, None) {
             self.worker_gone();
         }
     }
@@ -221,7 +224,7 @@ impl App {
         let (ptx, prx) = channel::<(usize, usize)>();
         self.notify_rx = Some(prx);
         self.transfer = Some(Transfer { label, done: 0, total });
-        if self.session.tx_send(job, reply, Some(ptx)).is_err() {
+        if !self.session.tx_send(job, reply, Some(ptx)) {
             self.worker_gone();
         }
     }
@@ -315,8 +318,8 @@ impl eframe::App for App {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
 
-        // Dim the app while the rename prompt is up, so it reads as modal.
-        if self.pending_upload.is_some() {
+        // Dim the app while a modal prompt is up, so it reads as modal.
+        if self.pending_upload.is_some() || self.pending_delete.is_some() {
             let screen = ctx.screen_rect();
             ctx.layer_painter(egui::LayerId::new(
                 egui::Order::Background,
@@ -494,13 +497,20 @@ impl eframe::App for App {
                     .filter_map(|&i| self.entries.get(i))
                     .map(|e| (self.path_of(&e.name), e.is_dir))
                     .collect();
-                self.send(Job::DeleteMany(targets));
+                // Deleting is irreversible on the calculator, so confirm first.
+                self.pending_delete = Some(targets);
             }
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             // Keyboard: Enter opens, Backspace goes up, Ctrl+A selects all.
-            if !self.busy && self.calc_ready {
+            // Suppressed while a modal prompt is up, or typing in the rename box
+            // would also navigate the listing behind it.
+            if !self.busy
+                && self.calc_ready
+                && self.pending_upload.is_none()
+                && self.pending_delete.is_none()
+            {
                 if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     if let Some(i) = self.single_selection() {
                         self.open_index(i);
@@ -620,6 +630,7 @@ impl eframe::App for App {
         });
 
         self.show_rename_prompt(ctx);
+        self.show_delete_prompt(ctx);
     }
 }
 
@@ -754,6 +765,52 @@ impl App {
         }
     }
 
+    /// Modal asking the user to confirm an irreversible delete.
+    fn show_delete_prompt(&mut self, ctx: &egui::Context) {
+        let Some(targets) = self.pending_delete.clone() else {
+            return;
+        };
+        let mut answer: Option<bool> = None;
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            answer = Some(false);
+        }
+        let names: Vec<String> = targets.iter().map(|(p, _)| file_label(p)).collect();
+        let listed = names.join(", ");
+        egui::Window::new("Confirm delete")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_max_width(420.0);
+                ui.label(format!(
+                    "Delete {} item(s) from the calculator? This cannot be undone.",
+                    targets.len()
+                ));
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(listed).weak());
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Delete").clicked() {
+                        answer = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        answer = Some(false);
+                    }
+                });
+            });
+        match answer {
+            Some(true) => {
+                self.pending_delete = None;
+                self.send(Job::DeleteMany(targets));
+            }
+            Some(false) => {
+                self.pending_delete = None;
+                self.status = "Delete cancelled.".into();
+            }
+            None => {}
+        }
+    }
+
     /// Act on an entry the way a double-click should: folders open, files
     /// download.
     fn open_index(&mut self, i: usize) {
@@ -829,10 +886,11 @@ fn worker(reqs: Receiver<Request>) {
                         if failed.is_empty() {
                             Done::Ok(format!("Deleted {deleted} item(s)"))
                         } else if deleted > 0 {
-                            // Some succeeded, so the listing changed: report as Ok so
-                            // the UI refreshes, with the failures noted.
+                            // Some succeeded, so report as Ok to refresh the
+                            // listing, but lead with the failure so it cannot be
+                            // mistaken for a clean success.
                             Done::Ok(format!(
-                                "Deleted {deleted}/{}; failed: {}",
+                                "Partial failure: deleted {deleted}/{}; failed: {}",
                                 targets.len(),
                                 failed.join("; ")
                             ))
@@ -1004,13 +1062,15 @@ fn duplicate_name(name: &str, existing: &[DirItem]) -> String {
     if !taken(&first) {
         return first;
     }
-    for n in 2..1000 {
+    // There is always a free slot by the time the counter passes the number of
+    // existing names, so this range cannot run out.
+    for n in 2..existing.len() + 2 {
         let candidate = format!("{stem} (copy {n}){ext}");
         if !taken(&candidate) {
             return candidate;
         }
     }
-    format!("{stem} (copy){ext}")
+    unreachable!()
 }
 
 /// Decide the device name for a local file being uploaded.
@@ -1073,16 +1133,41 @@ fn format_date(d: u32) -> String {
     let year = ((d >> 9) & 0x7F) + 1980;
     let month = (d >> 5) & 0x0F;
     let day = d & 0x1F;
-    if (1..=12).contains(&month) && (1..=31).contains(&day) {
+    if (1..=12).contains(&month) && (1..=days_in_month(year, month)).contains(&day) {
         format!("{year:04}-{month:02}-{day:02}")
     } else {
         format!("{d:#010x}")
     }
 }
 
+fn days_in_month(year: u32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year.is_multiple_of(4) && !year.is_multiple_of(100) || year.is_multiple_of(400) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_date_renders_packed_dates() {
+        // Packed form the device uses: year-1980 << 9 | month << 5 | day.
+        let packed = |y: u32, m: u32, d: u32| ((y - 1980) << 9) | (m << 5) | d;
+        assert_eq!(format_date(packed(2025, 2, 9)), "2025-02-09");
+        assert_eq!(format_date(packed(1980, 1, 1)), "1980-01-01");
+        assert_eq!(format_date(packed(2024, 2, 29)), "2024-02-29"); // leap year
+        // Sentinels and impossible dates fall back to hex rather than lying.
+        assert_eq!(format_date(0), "-");
+        assert_eq!(format_date(0xFFFF_FFFF), "-");
+        assert_eq!(format_date(packed(2025, 2, 31)), format!("{:#010x}", packed(2025, 2, 31)));
+        assert_eq!(format_date(packed(2025, 13, 1)), format!("{:#010x}", packed(2025, 13, 1)));
+        assert_eq!(format_date(packed(2023, 2, 29)), format!("{:#010x}", packed(2023, 2, 29)));
+    }
 
     #[test]
     fn parent_of_root_and_nested() {

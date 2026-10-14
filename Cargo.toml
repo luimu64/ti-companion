@@ -13,7 +13,6 @@ exclude = ["/.github", "/packaging"]
 [dependencies]
 rusb = "0.9"
 eframe = "0.29"
-egui = "0.29"
 rfd = "0.15"
 rmcp = { version = "3.5.1", features = ["server", "transport-io"] }
 tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros"] }

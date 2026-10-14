@@ -99,8 +99,8 @@ impl UsbLink {
         let config = device.active_config_descriptor()?;
         let mut ep_in = 0u8;
         let mut ep_out = 0u8;
-        if let Some(iface) = config.interfaces().next() {
-            if let Some(desc) = iface.descriptors().next() {
+        'ep: for iface in config.interfaces() {
+            for desc in iface.descriptors() {
                 for ep in desc.endpoint_descriptors() {
                     let addr = ep.address();
                     if addr & 0x80 != 0 {
@@ -109,6 +109,9 @@ impl UsbLink {
                         }
                     } else if ep_out == 0 {
                         ep_out = addr;
+                    }
+                    if ep_in != 0 && ep_out != 0 {
+                        break 'ep;
                     }
                 }
             }
@@ -158,56 +161,86 @@ impl UsbLink {
     }
 
     /// Send a packet and wait for its ACK (classic transport only).
-    ///
-    /// The caller owns every address/service field; the transport only supplies
-    /// the sequence number and consumes the matching acknowledgement. `host_sid`
-    /// is the service id the device will direct its replies to.
-    pub fn send_packet(&mut self, mut p: Packet, host_sid: u16) -> Result<(), TransportError> {
-        p.seq = self.seq;
-        self.write_raw(&p.encode())?;
-
-        // Wait for the matching ACK, NACKing anything else (e.g. LOGIN).
-        let mut buf = vec![0u8; HEADER_SIZE + MAX_DATA_CLASSIC];
-        loop {
-            let n = self.read_raw(&mut buf)?;
-            let r = Packet::decode(&buf[..n])
-                .ok_or_else(|| TransportError::Protocol("bad packet from device".into()))?;
-            if r.dst_sid == host_sid {
-                if r.src_sid == protocol::SID_ACK || r.src_sid == protocol::SID_ACK0 {
-                    self.seq = self.seq.wrapping_add(1);
-                    if self.seq == 0 {
-                        self.seq = 1;
-                    }
-                    return Ok(());
-                }
-                if r.src_sid == protocol::SID_NACK {
-                    return Err(TransportError::Protocol("device NACKed request".into()));
-                }
-            } else {
-                // Not for us: ACK disconnects, NACK everything else.
-                let reply = protocol::ack_for(&r, r.dst_sid != protocol::SID_DISCONNECT);
-                let _ = self.write_raw(&reply.encode());
-            }
-        }
+    pub fn send_packet(&mut self, p: Packet, host_sid: u16) -> Result<(), TransportError> {
+        let next = classic_send(self, self.seq, p, host_sid)?;
+        self.seq = next;
+        Ok(())
     }
 
     /// Receive a data packet addressed to the host, ACKing it.
     pub fn recv_packet(&mut self, maxlen: usize, host_sid: u16) -> Result<Packet, TransportError> {
-        let mut buf = vec![0u8; HEADER_SIZE + MAX_DATA_CX2];
-        loop {
-            let n = self.read_raw(&mut buf)?;
-            let r = Packet::decode(&buf[..n])
-                .ok_or_else(|| TransportError::Protocol("bad packet from device".into()))?;
-            if r.dst_sid == host_sid {
-                let ack = protocol::ack_for(&r, false);
-                self.write_raw(&ack.encode())?;
-                let mut r = r;
-                r.data.truncate(maxlen.min(r.data.len()));
-                return Ok(r);
+        classic_recv(self, maxlen, host_sid)
+    }
+}
+
+/// Raw byte pipe, so the classic packet exchange can be driven by a fake in
+/// tests without USB hardware.
+trait Pipe {
+    fn write_raw(&self, buf: &[u8]) -> Result<(), TransportError>;
+    fn read_raw(&self, buf: &mut [u8]) -> Result<usize, TransportError>;
+}
+
+impl Pipe for UsbLink {
+    fn write_raw(&self, buf: &[u8]) -> Result<(), TransportError> {
+        UsbLink::write_raw(self, buf)
+    }
+    fn read_raw(&self, buf: &mut [u8]) -> Result<usize, TransportError> {
+        UsbLink::read_raw(self, buf)
+    }
+}
+
+/// Classic exchange: send `p`, consuming its ACK/NACK and answering foreign
+/// packets. Returns the next sequence number. The caller owns every
+/// address/service field; `host_sid` is the service id the device replies to.
+fn classic_send(
+    pipe: &impl Pipe,
+    mut seq: u8,
+    mut p: Packet,
+    host_sid: u16,
+) -> Result<u8, TransportError> {
+    p.seq = seq;
+    pipe.write_raw(&p.encode())?;
+
+    // Wait for the matching ACK, NACKing anything else (e.g. LOGIN).
+    let mut buf = vec![0u8; HEADER_SIZE + MAX_DATA_CLASSIC];
+    loop {
+        let n = pipe.read_raw(&mut buf)?;
+        let r = Packet::decode(&buf[..n])
+            .ok_or_else(|| TransportError::Protocol("bad packet from device".into()))?;
+        if r.dst_sid == host_sid {
+            if r.src_sid == protocol::SID_ACK || r.src_sid == protocol::SID_ACK0 {
+                seq = seq.wrapping_add(1);
+                if seq == 0 {
+                    seq = 1;
+                }
+                return Ok(seq);
             }
+            if r.src_sid == protocol::SID_NACK {
+                return Err(TransportError::Protocol("device NACKed request".into()));
+            }
+        } else {
+            // Not for us: ACK disconnects, NACK everything else.
             let reply = protocol::ack_for(&r, r.dst_sid != protocol::SID_DISCONNECT);
-            let _ = self.write_raw(&reply.encode());
+            let _ = pipe.write_raw(&reply.encode());
         }
+    }
+}
+
+/// Classic receive: return the first packet addressed to the host, ACKing it.
+fn classic_recv(pipe: &impl Pipe, maxlen: usize, host_sid: u16) -> Result<Packet, TransportError> {
+    let mut buf = vec![0u8; HEADER_SIZE + MAX_DATA_CX2];
+    loop {
+        let n = pipe.read_raw(&mut buf)?;
+        let mut r = Packet::decode(&buf[..n])
+            .ok_or_else(|| TransportError::Protocol("bad packet from device".into()))?;
+        if r.dst_sid == host_sid {
+            let ack = protocol::ack_for(&r, false);
+            pipe.write_raw(&ack.encode())?;
+            r.data.truncate(maxlen.min(r.data.len()));
+            return Ok(r);
+        }
+        let reply = protocol::ack_for(&r, r.dst_sid != protocol::SID_DISCONNECT);
+        let _ = pipe.write_raw(&reply.encode());
     }
 }
 
@@ -327,11 +360,9 @@ impl Cx2Link {
                 let _ = self.write_nnse(&m);
                 return true;
             }
-            NNSE_SVC_UNKNOWN => {
-                if data.len() == 1 && data[0] == 0x01 {
-                    let m = Self::build_nnse(NNSE_SVC_UNKNOWN, 0, self.next_seq(), &[0x81, 0x03]);
-                    let _ = self.write_nnse(&m);
-                }
+            NNSE_SVC_UNKNOWN if data.len() == 1 && data[0] == 0x01 => {
+                let m = Self::build_nnse(NNSE_SVC_UNKNOWN, 0, self.next_seq(), &[0x81, 0x03]);
+                let _ = self.write_nnse(&m);
             }
             _ => {}
         }
@@ -445,6 +476,91 @@ fn nnse_checksum(data: &[u8]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Scripted in-memory pipe: queued reads, recorded writes, no USB.
+    struct FakePipe {
+        reads: std::cell::RefCell<std::collections::VecDeque<Vec<u8>>>,
+        writes: std::cell::RefCell<Vec<Vec<u8>>>,
+    }
+
+    impl FakePipe {
+        fn new(reads: Vec<Vec<u8>>) -> Self {
+            FakePipe {
+                reads: std::cell::RefCell::new(reads.into()),
+                writes: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Pipe for FakePipe {
+        fn write_raw(&self, buf: &[u8]) -> Result<(), TransportError> {
+            self.writes.borrow_mut().push(buf.to_vec());
+            Ok(())
+        }
+        fn read_raw(&self, buf: &mut [u8]) -> Result<usize, TransportError> {
+            let chunk = self
+                .reads
+                .borrow_mut()
+                .pop_front()
+                .ok_or(TransportError::NoDevice)?;
+            let n = chunk.len().min(buf.len());
+            buf[..n].copy_from_slice(&chunk[..n]);
+            Ok(n)
+        }
+    }
+
+    fn ack_from_device(src_sid: u16, seq: u8) -> Packet {
+        Packet::new(protocol::DEVICE_ADDR, src_sid, protocol::HOST_ADDR, protocol::HOST_SID, seq)
+    }
+
+    #[test]
+    fn classic_send_advances_seq_on_ack() {
+        let pipe = FakePipe::new(vec![ack_from_device(protocol::SID_ACK, 1).encode()]);
+        let req = Packet::new(protocol::HOST_ADDR, protocol::HOST_SID, protocol::DEVICE_ADDR, protocol::SID_FILE, 0);
+        let next = classic_send(&pipe, 1, req, protocol::HOST_SID).unwrap();
+        assert_eq!(next, 2);
+        assert_eq!(pipe.writes.borrow().len(), 1); // just the request
+    }
+
+    #[test]
+    fn classic_send_fails_on_nack() {
+        let pipe = FakePipe::new(vec![ack_from_device(protocol::SID_NACK, 1).encode()]);
+        let req = Packet::new(protocol::HOST_ADDR, protocol::HOST_SID, protocol::DEVICE_ADDR, protocol::SID_FILE, 0);
+        assert!(classic_send(&pipe, 1, req, protocol::HOST_SID).is_err());
+    }
+
+    #[test]
+    fn classic_send_nacks_foreign_then_accepts_ack() {
+        // A packet for someone else is NACKed; the following ACK is consumed.
+        let foreign = Packet::new(protocol::DEVICE_ADDR, 0x4003, protocol::HOST_ADDR, 0x9999, 0);
+        let pipe = FakePipe::new(vec![
+            foreign.encode(),
+            ack_from_device(protocol::SID_ACK, 5).encode(),
+        ]);
+        let req = Packet::new(protocol::HOST_ADDR, protocol::HOST_SID, protocol::DEVICE_ADDR, protocol::SID_FILE, 0);
+        let next = classic_send(&pipe, 5, req, protocol::HOST_SID).unwrap();
+        assert_eq!(next, 6);
+        let writes = pipe.writes.borrow();
+        assert_eq!(writes.len(), 2); // request + NACK reply
+        assert_eq!(Packet::decode(&writes[1]).unwrap().src_sid, protocol::SID_NACK);
+    }
+
+    #[test]
+    fn classic_recv_acks_and_returns_data() {
+        let data = Packet {
+            src_addr: protocol::DEVICE_ADDR,
+            src_sid: protocol::SID_FILE,
+            dst_addr: protocol::HOST_ADDR,
+            dst_sid: protocol::HOST_SID,
+            ack: 0,
+            seq: 7,
+            data: vec![1, 2, 3],
+        };
+        let pipe = FakePipe::new(vec![data.encode()]);
+        let got = classic_recv(&pipe, 254, protocol::HOST_SID).unwrap();
+        assert_eq!(got.data, vec![1, 2, 3]);
+        assert_eq!(pipe.writes.borrow().len(), 1); // the ACK
+    }
 
     #[test]
     fn nnse_checksum_self_inverse() {
