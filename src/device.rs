@@ -473,15 +473,22 @@ impl Calc {
 
 /// Parse one `0x10` dirlist entry.
 /// Layout: `0x10`, entry-len:u16, padded(name), size:u32, date:u32, is_dir:u8, 0.
+///
+/// `entry-len` counts the bytes *after* the 3-byte prefix, so it equals the
+/// name field plus the 9 trailing bytes — not an offset from the start.
 fn parse_dirlist_entry(entry: &[u8]) -> R<DirItem> {
     if entry.len() < 3 || entry[0] != 0x10 {
         return Err(TransportError::Protocol("unexpected dirlist entry".into()));
     }
     let entry_len = u16::from_be_bytes([entry[1], entry[2]]) as usize;
     let (name, off) = read_padded_string(entry, 3)?;
-    // The declared length must at least cover the name and the trailing fields.
-    if entry_len < off + 9 || off + 9 > entry.len() {
-        return Err(TransportError::Protocol("truncated dirlist entry".into()));
+    // The declared length must cover the name field and the trailing fields;
+    // `off` is already past the name field, so subtract the 3-byte prefix.
+    if entry_len < (off - 3) + 9 || off + 9 > entry.len() {
+        return Err(TransportError::Protocol(format!(
+            "truncated dirlist entry: declared {entry_len}, need {}",
+            (off - 3) + 9
+        )));
     }
     let size = u32::from_be_bytes([entry[off], entry[off + 1], entry[off + 2], entry[off + 3]]);
     let date = u32::from_be_bytes([entry[off + 4], entry[off + 5], entry[off + 6], entry[off + 7]]);
@@ -613,6 +620,31 @@ mod tests {
         e.extend_from_slice(b"F\xffo\0\0\0\0\0");
         e.extend_from_slice(&[0u8; 9]);
         assert!(parse_dirlist_entry(&e).is_err());
+    }
+
+    #[test]
+    fn dirlist_entry_length_is_relative_to_the_prefix() {
+        // Byte-for-byte from a TI-Nspire CX CAS: a 14-char name, entry-len 25
+        // (= 14 name bytes + 1 NUL + 9 trailing + 1 pad), buffer 28 bytes.
+        let raw: Vec<u8> = [
+            &[0x10u8, 0x00, 0x19][..],
+            b"NspireLogs.zip\0",
+            &[0x00, 0x00, 0x00, 0x00],
+            &0x0000_4cf6u32.to_be_bytes(),
+            &[0x00, 0x00],
+        ]
+        .concat();
+        assert_eq!(raw.len(), 28);
+        let item = parse_dirlist_entry(&raw).unwrap();
+        assert_eq!(item.name, "NspireLogs.zip");
+        assert_eq!(item.size, 0);
+        assert_eq!(item.date, 0x0000_4cf6);
+        assert!(!item.is_dir);
+
+        // Same entry but declaring fewer bytes than the fields need must fail.
+        let mut short = raw.clone();
+        short[1..3].copy_from_slice(&23u16.to_be_bytes());
+        assert!(parse_dirlist_entry(&short).is_err());
     }
 
     #[test]
