@@ -11,16 +11,23 @@ Scope: everything related to *file operations on the physical calculator*:
   `Backspace` goes up a level, and the breadcrumb path jumps to any ancestor
 * multi-select with `Ctrl`-click (toggle) and `Shift`-click (range), `Ctrl+A`
   selects all; bulk delete acts on the whole selection
-* upload files
-* download files
+* upload files (any local file; see the naming note below)
+* download files, with a progress indicator
 * rename / move
 * copy / duplicate
-* delete files (single or in bulk)
+* delete files or folders (single or in bulk), confirmed in a modal first
 * create and delete folders
 * read file attributes and device information
 
 The listing refreshes automatically after any action that changes it (upload,
 rename, copy, delete, new folder).
+
+**File naming.** The calculator only stores documents whose name ends in
+`.tns` (lowercase); it does not inspect the contents. When you upload anything
+else, the GUI prompts and uploads it as `<name>.<ext>.tns` — the original
+extension is kept in front of the forced `.tns` — so e.g. `report.pdf` becomes
+`report.pdf.tns`. Files already ending in `.tns` are uploaded unchanged.
+Anything the device still refuses is reported as "unsupported file type".
 
 Emulator/document features of the official Student Software are intentionally
 out of scope.
@@ -36,18 +43,22 @@ Build requirements: a Rust toolchain and a C compiler plus libusb headers
 (`libusb-1.0-0-dev` on Debian/Ubuntu, `libusb-devel` on Fedora,
 `libusb` on Arch/macOS via Homebrew).
 
-At runtime on Linux, `zenity` must be installed: `rfd` uses it for the file
-pickers. Without it the pickers are silently reported as cancelled, so choosing
-a file to upload or download appears to do nothing.
+At runtime on Linux, the file pickers go through `rfd`'s default XDG Desktop
+Portal backend, so a portal implementation must be running — GNOME, KDE or
+`xdg-desktop-portal-gtk`. The wlroots portal backend does not implement the
+D-Bus API `rfd` needs. Without a suitable portal the pickers are silently
+reported as cancelled, so choosing a file to upload or download appears to do
+nothing. (`zenity` is not used.)
 
-### Prebuilt AppImage
+### Prebuilt binaries
 
-Every commit on `master` is built into a standalone x86_64 AppImage and
-published to the rolling [`latest` release](../../releases/tag/latest). That
-tag always points at the newest build, so this URL is stable:
+Every commit on `master` is built and published to the rolling
+[`latest` release](../../releases/tag/latest) — an x86_64 AppImage for Linux and
+a standalone x86_64 `.exe` for Windows. That tag always points at the newest
+build, so this URL is stable:
 
 ```sh
-# The asset filename includes the build date and commit, so list before fetching:
+# The asset filenames include the build date and commit, so list before fetching:
 curl -fsS https://api.github.com/repos/luimu64/ti-companion/releases/tags/latest \
   | grep browser_download_url
 ```
@@ -57,12 +68,13 @@ rolling tag is `latest`, so
 `https://github.com/luimu64/ti-companion/releases/tag/latest` always shows the
 newest build.
 
-Each commit also keeps a per-commit artifact
-(`TI-Nspire-Companion-<sha>-x86_64.AppImage`) on its workflow run for 90 days;
-that one downloads as a zip.
-
 The AppImage bundles libusb, so no system packages are required beyond the usual
-desktop graphics stack.
+desktop graphics stack. On Windows, run the `.exe` directly; it links libusb
+statically.
+
+Each commit also keeps per-commit artifacts
+(`TI-Nspire-Companion-<sha>-x86_64.AppImage` and `…-x86_64.exe`) on its workflow
+run for 90 days; those download as a zip.
 
 Build the AppImage yourself with [`appimagetool`](https://github.com/AppImage/appimagetool):
 
@@ -127,9 +139,9 @@ Tools (all operate on the physical calculator):
 | `copy` | copy a file or folder |
 | `delete` | delete a file or (empty) folder |
 
-Note: the calculator only accepts documents with a supported extension
-(typically `.tns` and `.tcc`); anything else is reported as
-"unsupported file type".
+Note: the calculator only accepts documents whose name ends in `.tns`. Unlike
+the GUI, the MCP tools do **not** rename for you — pass a `.tns` path, or the
+device reports "unsupported file type".
 
 On Linux, install the udev rule so the calculator is accessible without root:
 
@@ -280,7 +292,10 @@ Strings are NUL-terminated and zero-padded so they occupy at least 8 bytes
 before the terminator.
 
 Device information (service 0x4020): command `01` returns the packed device
-info structure, `02` the device name, `03` the file/OS extensions.
+info structure, `02` the device name, `03` the file/OS extensions. Status bytes
+are mapped to text via the table transcribed from `navnet.dll` at VA
+`0x18004ec00` (`device.rs::status_text`), which is where "unsupported file
+type" and "file not found" come from.
 
 ## Layout
 
@@ -298,12 +313,21 @@ packaging/        desktop entry and icon used to build the AppImage
 * Verified against a physical **TI-Nspire CX CAS** (PID 0xE012): connect,
   handshake, device info, directory listing, upload, download, mkdir, rename,
   copy and delete all confirmed working, both from the GUI and over MCP.
+* **CX II / CX CAS 2 (PID 0xE022) is not tested.** The NNSE transport is
+  implemented from the reversed format and the ACK path has unit tests, but it
+  has never been run against CX II hardware. Treat CX CAS 2 support as
+  unverified.
 * The framing, command codes and payload layouts are pinned by the reversed
-  binary and covered by unit tests (including a golden packet vector).
-* Uploads are validated by the calculator: only supported document extensions
-  (`.tns`, `.tcc`) are accepted; the error is reported clearly.
-* The CX II (NNSE) transport is implemented from the reversed format but has not
-  been exercised against CX II hardware.
+  binary and covered by unit tests (including a golden packet vector, the
+  classic ACK state machine via a fake pipe, and date/status formatting).
+* Uploads are validated by the calculator: only `.tns` names are accepted. The
+  GUI renames other uploads with a prompt; the MCP tools do not rename.
+* Deletes are confirmed in a modal (Escape cancels) and keyboard shortcuts are
+  suppressed while a prompt is open, so a stray `Ctrl+A` + `Delete` cannot wipe
+  a directory. Partial bulk-delete failures are reported as
+  `Partial failure: …` rather than a plain success.
+* A download whose announced size exceeds 256 MB is rejected before allocating,
+  so a garbled header cannot OOM the process.
 * Only the file-management and device-information services are implemented;
   OS install, screenshots and Navigator features are deliberately left out.
 
