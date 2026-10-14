@@ -115,7 +115,7 @@ impl Packet {
         let dst_addr = u16::from_be_bytes([buf[6], buf[7]]);
         let dst_sid = u16::from_be_bytes([buf[8], buf[9]]);
         let stored_dc = u16::from_be_bytes([buf[10], buf[11]]);
-        let (data, dc) = if buf[12] == 0xFF {
+        let data = if buf[12] == 0xFF {
             if buf.len() < 20 {
                 return None;
             }
@@ -123,17 +123,14 @@ impl Packet {
             if buf.len() < 20 + size {
                 return None;
             }
-            (buf[20..20 + size].to_vec(), &buf[16..])
+            buf[20..20 + size].to_vec()
         } else {
             let size = buf[12] as usize;
             if buf.len() < HEADER_SIZE + size {
                 return None;
             }
-            (buf[HEADER_SIZE..HEADER_SIZE + size].to_vec(), &buf[0..0])
+            buf[HEADER_SIZE..HEADER_SIZE + size].to_vec()
         };
-        // `dc` slice trick above is only used to keep the borrow checker quiet;
-        // the real checksum covers just the logical data payload.
-        let _ = dc;
         if data_checksum(&data) != stored_dc {
             return None;
         }

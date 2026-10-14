@@ -285,6 +285,15 @@ impl Cx2Link {
         Err(TransportError::Protocol("CX II handshake did not complete".into()))
     }
 
+    /// Answer a frame's request-for-ack with an NNSE ack, when it asked for one.
+    fn ack_nnse(&mut self, msg: &[u8]) {
+        if msg.len() >= 16 && msg[5] & 1 != 0 {
+            let seqno = u16::from_be_bytes([msg[14], msg[15]]);
+            let ack = Self::build_nnse(msg[1] | NNSE_ACK_FLAG, msg[5] & !1, seqno, &[]);
+            let _ = self.write_nnse(&ack);
+        }
+    }
+
     /// Handle one NNSE control message. Returns true once the time response
     /// (handshake completion) has been sent.
     fn handle_msg(&mut self, msg: &[u8]) -> bool {
@@ -294,20 +303,15 @@ impl Cx2Link {
         let service = msg[1];
         let src = msg[2];
         let dest = msg[3];
-        let req_ack = msg[5];
         let length = u16::from_be_bytes([msg[12], msg[13]]) as usize;
-        let seqno = u16::from_be_bytes([msg[14], msg[15]]);
         if dest != NNSE_ADDR_ME && dest != 0xFF {
             return false;
         }
         if service & NNSE_ACK_FLAG != 0 {
             return false;
         }
-        if req_ack & 1 != 0 {
-            let ack = Self::build_nnse(service | NNSE_ACK_FLAG, req_ack & !1, seqno, &[]);
-            let _ = self.write_nnse(&ack);
-        }
-        let data = &msg[16..length.min(msg.len())];
+        self.ack_nnse(msg);
+        let data = &msg[16..length.clamp(16, msg.len())];
         match service & !NNSE_ACK_FLAG {
             NNSE_SVC_TIME => {
                 // Time response: sec(u32) + frac(u64) + frac2(u32) after a 0x80 byte.
@@ -368,11 +372,17 @@ impl Cx2Link {
                 Err(_) => continue,
             };
             if m.len() >= 16 && (m[1] & !NNSE_ACK_FLAG) == NNSE_SVC_STREAM {
+                self.ack_nnse(&m);
                 let length = u16::from_be_bytes([m[12], m[13]]) as usize;
-                let data = &m[16..length.min(m.len())];
+                let data = &m[16..length.clamp(16, m.len())];
                 if let Some(p) = Packet::decode(data) {
                     let mut p = p;
                     p.data.truncate(maxlen.min(p.data.len()));
+                    // Ack at the NavNet layer too: as on the classic transport,
+                    // the device waits for it before sending the next chunk.
+                    let ack = protocol::ack_for(&p, false);
+                    let msg = Self::build_nnse(NNSE_SVC_STREAM, 0, self.next_seq(), &ack.encode());
+                    let _ = self.write_nnse(&msg);
                     return Ok(p);
                 }
             }

@@ -106,8 +106,9 @@ impl CalcServer {
     #[tool(description = "Upload a local file to the calculator at the given path.")]
     fn upload_file(&self, Parameters(UploadArg { path, local_file }): Parameters<UploadArg>) -> Result<String, String> {
         let data = std::fs::read(&local_file).map_err(|e| format!("read {local_file}: {e}"))?;
-        match self.session.call(Job::Upload(path.clone(), data.clone())) {
-            Done::Ok(_) => Ok(format!("uploaded {} bytes to {path}", data.len())),
+        let len = data.len();
+        match self.session.call(Job::Upload(path.clone(), data)) {
+            Done::Ok(_) => Ok(format!("uploaded {len} bytes to {path}")),
             Done::Err(e) => err(e),
             _ => err("unexpected reply to upload_file"),
         }
@@ -140,8 +141,9 @@ impl CalcServer {
         Parameters(WriteArg { path, data_base64 }): Parameters<WriteArg>,
     ) -> Result<String, String> {
         let data = unb64(&data_base64).map_err(|e| format!("bad base64: {e}"))?;
-        match self.session.call(Job::Upload(path.clone(), data.clone())) {
-            Done::Ok(_) => Ok(format!("wrote {} bytes to {path}", data.len())),
+        let len = data.len();
+        match self.session.call(Job::Upload(path.clone(), data)) {
+            Done::Ok(_) => Ok(format!("wrote {len} bytes to {path}")),
             Done::Err(e) => err(e),
             _ => err("unexpected reply to write_file"),
         }

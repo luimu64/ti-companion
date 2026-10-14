@@ -50,7 +50,6 @@ pub struct DevInfo {
     pub lcd_width: u16,
     pub lcd_height: u16,
     pub device_name: String,
-    pub electronic_id: String,
     pub runlevel: u16,
 }
 
@@ -443,7 +442,6 @@ impl Calc {
             lcd_width: u16::from_be_bytes([d[58], d[59]]),
             lcd_height: u16::from_be_bytes([d[60], d[61]]),
             device_type: d[64],
-            electronic_id: String::new(),
             device_name: String::new(),
         };
 
@@ -470,9 +468,10 @@ fn parse_dirlist_entry(entry: &[u8]) -> R<DirItem> {
     if entry.len() < 3 || entry[0] != 0x10 {
         return Err(TransportError::Protocol("unexpected dirlist entry".into()));
     }
-    let (name, off) = read_padded_string(entry, 3)
-        .ok_or_else(|| TransportError::Protocol("bad dirlist name".into()))?;
-    if off + 9 > entry.len() {
+    let entry_len = u16::from_be_bytes([entry[1], entry[2]]) as usize;
+    let (name, off) = read_padded_string(entry, 3)?;
+    // The declared length must at least cover the name and the trailing fields.
+    if entry_len < off + 9 || off + 9 > entry.len() {
         return Err(TransportError::Protocol("truncated dirlist entry".into()));
     }
     let size = u32::from_be_bytes([entry[off], entry[off + 1], entry[off + 2], entry[off + 3]]);
@@ -492,17 +491,25 @@ fn push_padded_string(out: &mut Vec<u8>, s: &str) {
 }
 
 /// Read a NUL-terminated, min-8-byte-padded string; returns (string, next offset).
-fn read_padded_string(buf: &[u8], start: usize) -> Option<(String, usize)> {
-    let nul = buf[start..].iter().position(|&b| b == 0)? + start;
-    let name = String::from_utf8_lossy(&buf[start..nul]).into_owned();
+/// Rejects a name that is not valid UTF-8 rather than replacing its bytes, so a
+/// later operation cannot target the wrong file.
+fn read_padded_string(buf: &[u8], start: usize) -> R<(String, usize)> {
+    let nul = buf[start..]
+        .iter()
+        .position(|&b| b == 0)
+        .map(|p| p + start)
+        .ok_or_else(|| TransportError::Protocol("bad dirlist name".into()))?;
+    let name = std::str::from_utf8(&buf[start..nul])
+        .map_err(|_| TransportError::Protocol("non-UTF-8 file name".into()))?
+        .to_string();
     let consumed = nul - start;
     let next = if consumed < 8 { start + 8 + 1 } else { nul + 1 };
-    Some((name, next))
+    Ok((name, next))
 }
 
 fn cstr_from(buf: &[u8]) -> Option<String> {
     let nul = buf.iter().position(|&b| b == 0)?;
-    Some(String::from_utf8_lossy(&buf[..nul]).into_owned())
+    std::str::from_utf8(&buf[..nul]).ok().map(str::to_string)
 }
 
 /// Map a device status byte to the 16-bit error code the TI software uses.
@@ -528,13 +535,9 @@ fn status_text(code: u8) -> String {
         Some(0xFEEA) | Some(0xFEEB) => "permission denied",
         Some(0xFEEC) | Some(0xFEED) => "bad path",
         Some(0xFEEF) => "protocol error",
-        Some(0xFEF1) => "battery too low",
         Some(0xFEF3) => "device busy",
         Some(0xFEF6) => "operation cancelled",
         Some(0xFEF8) => "file not found",
-        Some(0xFEFD) => "device not responding",
-        Some(0xFEFE) => "incomplete transaction",
-        Some(0xFEFF) => "invalid connection",
         Some(0xFFFF) => "storage full",
         _ => "device error",
     };
@@ -575,6 +578,21 @@ mod tests {
         assert_eq!(item.size, 0x1122_3344);
         assert_eq!(item.date, 0x0000_5555);
         assert!(!item.is_dir);
+    }
+
+    #[test]
+    fn dirlist_entry_rejects_bad_length_and_utf8() {
+        // entry-len says 5, too short to hold the name and trailing fields.
+        let mut e = vec![0x10, 0x00, 0x05];
+        e.extend_from_slice(b"Foo\0\0\0\0\0\0");
+        e.extend_from_slice(&[0u8; 9]);
+        assert!(parse_dirlist_entry(&e).is_err());
+
+        // A name carrying a non-UTF-8 byte is rejected, not lossily replaced.
+        let mut e = vec![0x10, 0x00, 0x15];
+        e.extend_from_slice(b"F\xffo\0\0\0\0\0");
+        e.extend_from_slice(&[0u8; 9]);
+        assert!(parse_dirlist_entry(&e).is_err());
     }
 
     #[test]

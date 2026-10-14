@@ -88,7 +88,6 @@ fn probe() {
 }
 
 /// A unit of work handed to the calculator thread.
-#[derive(Clone)]
 pub enum Job {
     Connect,
     List(String),
@@ -104,7 +103,6 @@ pub enum Job {
 }
 
 /// The result of a job, delivered back to the requester.
-#[derive(Clone)]
 pub enum Done {
     Connected { name: String, cx2: bool },
     Listed { path: String, items: Vec<DirItem> },
@@ -211,7 +209,9 @@ impl App {
     fn send(&mut self, job: Job) {
         self.busy = true;
         let reply = self.reply_tx.clone();
-        let _ = self.session.tx_send(job, reply, None);
+        if self.session.tx_send(job, reply, None).is_err() {
+            self.worker_gone();
+        }
     }
 
     /// Send a job that reports byte progress, tracked in `self.transfer`.
@@ -221,7 +221,18 @@ impl App {
         let (ptx, prx) = channel::<(usize, usize)>();
         self.notify_rx = Some(prx);
         self.transfer = Some(Transfer { label, done: 0, total });
-        let _ = self.session.tx_send(job, reply, Some(ptx));
+        if self.session.tx_send(job, reply, Some(ptx)).is_err() {
+            self.worker_gone();
+        }
+    }
+
+    /// The calculator thread is gone, so no reply will ever arrive; clear the
+    /// busy flag instead of leaving every action disabled forever.
+    fn worker_gone(&mut self) {
+        self.busy = false;
+        self.transfer = None;
+        self.notify_rx = None;
+        self.status = "Calculator worker stopped. Restart the app.".into();
     }
 
     /// Drain byte-progress messages into the transfer indicator.
