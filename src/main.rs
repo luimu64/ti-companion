@@ -482,7 +482,10 @@ impl eframe::App for App {
             }
 
             ui.separator();
-            if ui.add_enabled(enabled && single.is_some(), egui::Button::new("Duplicate (copy)")).clicked() {
+            // The device's copy command only accepts files; copying a folder
+            // means recreating its tree by hand, so don't offer it.
+            let dup_ok = enabled && single.is_some_and(|i| !self.entries[i].is_dir);
+            if ui.add_enabled(dup_ok, egui::Button::new("Duplicate (copy)")).clicked() {
                 let i = single.unwrap();
                 let name = self.entries[i].name.clone();
                 let src = self.path_of(&name);

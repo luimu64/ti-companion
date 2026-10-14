@@ -398,20 +398,18 @@ impl Calc {
         }
     }
 
-    /// Send a short command and check the 2-byte `FF <status>` reply.
+    /// Send a short command and wait for its final `FF <status>` reply.
+    ///
+    /// A copy of a large file streams `06 <progress>` packets first and only
+    /// then reports the outcome, so progress packets are skipped.
     fn simple_command(&mut self, data: &[u8]) -> R<()> {
         self.data_write(data)?;
-        let resp = self.data_read(2)?;
-        match resp.as_slice() {
-            [0xFF, 0x00] => Ok(()),
-            [0xFF, code] => Err(TransportError::Protocol(format!(
-                "command failed: {}",
-                status_text(*code)
-            ))),
-            // Some firmware variants echo the raw command word on success.
-            other => Err(TransportError::Protocol(format!(
-                "unexpected reply {other:02x?}"
-            ))),
+        loop {
+            let resp = self.data_read(254)?;
+            match reply_status(&resp) {
+                Some(res) => return res,
+                None => continue,
+            }
         }
     }
 
@@ -496,6 +494,22 @@ fn parse_dirlist_entry(entry: &[u8]) -> R<DirItem> {
     Ok(DirItem { name, size, date, is_dir })
 }
 
+/// Interpret one file-manager reply packet. `Some` means it is a final
+/// outcome; `None` means it was a `0x06` progress notification to skip.
+fn reply_status(resp: &[u8]) -> Option<R<()>> {
+    match resp {
+        [0xFF, 0x00] => Some(Ok(())),
+        [0xFF, code] => Some(Err(TransportError::Protocol(format!(
+            "command failed: {}",
+            status_text(*code)
+        )))),
+        [0x06, _] => None,
+        other => Some(Err(TransportError::Protocol(format!(
+            "unexpected reply {other:02x?}"
+        )))),
+    }
+}
+
 /// Append a NUL-terminated string padded so it occupies at least 8 bytes.
 fn push_padded_string(out: &mut Vec<u8>, s: &str) {
     let bytes = s.as_bytes();
@@ -576,6 +590,19 @@ mod tests {
         // Unknown / out-of-table codes fall back, still naming the raw status.
         assert!(status_text(200).contains("device error"));
         assert!(status_text(200).contains("0xc8"));
+    }
+
+    #[test]
+    fn reply_status_skips_progress_and_maps_outcomes() {
+        // `06 <pct>` is progress, not a result, so it must be skipped.
+        assert!(reply_status(&[0x06, 0x03]).is_none());
+        assert!(reply_status(&[0x06, 0x64]).is_none());
+        // `FF 00` is success; any other code is a failure.
+        assert!(matches!(reply_status(&[0xFF, 0x00]), Some(Ok(()))));
+        let err = reply_status(&[0xFF, 0x15]).unwrap().unwrap_err();
+        assert!(err.to_string().contains("unsupported file type"));
+        // Anything else is reported rather than silently accepted.
+        assert!(reply_status(&[0x10, 0x00]).unwrap().is_err());
     }
 
     #[test]

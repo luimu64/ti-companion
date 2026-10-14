@@ -167,7 +167,7 @@ impl CalcServer {
         }
     }
 
-    #[tool(description = "Copy a file or folder on the calculator.")]
+    #[tool(description = "Copy a file on the calculator. The device rejects folders.")]
     fn copy(&self, Parameters(RenameArg { from, to }): Parameters<RenameArg>) -> Result<String, String> {
         match self.session.call(Job::Copy(from, to)) {
             Done::Ok(m) => Ok(m),
