@@ -507,13 +507,16 @@ impl eframe::App for App {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             // Keyboard: Enter opens, Backspace goes up, Ctrl+A selects all.
-            // Suppressed while a modal prompt is up, or typing in the rename box
-            // would also navigate the listing behind it.
-            if !self.busy
-                && self.calc_ready
-                && self.pending_upload.is_none()
-                && self.pending_delete.is_none()
-            {
+            // Suppressed while a modal prompt is up or a text field has focus,
+            // or editing the rename/new-folder box would also navigate the
+            // listing behind it (Backspace would go up a directory).
+            if listing_shortcuts_live(
+                !self.busy,
+                self.calc_ready,
+                self.pending_upload.is_some(),
+                self.pending_delete.is_some(),
+                ctx.wants_keyboard_input(),
+            ) {
                 if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     if let Some(i) = self.single_selection() {
                         self.open_index(i);
@@ -1052,6 +1055,20 @@ fn apply_click(
     }
 }
 
+/// Whether the listing's keyboard shortcuts (Enter/Backspace/Ctrl+A) may run.
+///
+/// They must not, while a modal is up or while a text field is being edited:
+/// Backspace in the Rename box would otherwise also go up a directory.
+fn listing_shortcuts_live(
+    idle: bool,
+    calc_ready: bool,
+    modal_upload: bool,
+    modal_delete: bool,
+    text_focused: bool,
+) -> bool {
+    idle && calc_ready && !modal_upload && !modal_delete && !text_focused
+}
+
 /// Build a non-colliding copy name, keeping the suffix *before* the extension
 /// (the calculator rejects unknown extensions, so `a.tns` must become
 /// `a (copy).tns`, never `a.tns (copy)`).
@@ -1156,6 +1173,100 @@ fn days_in_month(year: u32, month: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editing_a_name_field_does_not_navigate_the_listing() {
+        // Regression: Backspace in the Rename box also went up a directory,
+        // and Ctrl+A selected all rows, because the listing shortcuts were
+        // guarded only against open modals.
+        //
+        // The guard is `ctx.wants_keyboard_input()`, modelled here headlessly:
+        // it must be false while the listing has focus and true only while a
+        // text field is being edited.
+        use eframe::egui::{self, Event, Key, Modifiers, RawInput, Rect, Vec2};
+
+        let ctx = egui::Context::default();
+        let mut name = String::new();
+        // A Cell, so the drawing closure can record the row rect without
+        // holding a borrow the test body also needs.
+        let row_rect = std::cell::Cell::new(Rect::NOTHING);
+        let draw = |ctx: &egui::Context, name: &mut String| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.text_edit_singleline(name);
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(300.0, 24.0), egui::Sense::hover());
+                ui.interact(rect, egui::Id::new("row0"), egui::Sense::click());
+                row_rect.set(rect);
+            });
+        };
+        let input = |events| RawInput {
+            screen_rect: Some(Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0))),
+            events,
+            ..Default::default()
+        };
+        let click = |pos, pressed| Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        let key = |key| Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        // The app's own guard, driven by egui's live focus state.
+        let shortcuts_live =
+            |text_focused: bool| listing_shortcuts_live(true, true, false, false, text_focused);
+
+        // Lay out so the field and row rects are known.
+        let _ = ctx.run(input(vec![]), |c| draw(c, &mut name));
+        let field_pos = egui::pos2(20.0, row_rect.get().top() - 14.0);
+        let row_center = row_rect.get().center();
+
+        // Nothing focused: listing shortcuts are live.
+        assert!(shortcuts_live(ctx.wants_keyboard_input()));
+
+        // Clicking a list row must not be treated as "editing text".
+        let _ = ctx.run(input(vec![click(row_center, true)]), |c| draw(c, &mut name));
+        let _ = ctx.run(input(vec![click(row_center, false)]), |c| draw(c, &mut name));
+        assert!(
+            shortcuts_live(ctx.wants_keyboard_input()),
+            "a clicked row must not block the shortcuts"
+        );
+
+        // Typing in the Rename box must block them, and must not navigate.
+        let _ = ctx.run(input(vec![click(field_pos, true)]), |c| draw(c, &mut name));
+        let _ = ctx.run(input(vec![click(field_pos, false)]), |c| draw(c, &mut name));
+        assert!(
+            !shortcuts_live(ctx.wants_keyboard_input()),
+            "an edited field must block the shortcuts"
+        );
+
+        // The text field swallows the key: it must not reach the listing.
+        let _ = ctx.run(input(vec![key(Key::Backspace)]), |c| draw(c, &mut name));
+        assert!(!shortcuts_live(ctx.wants_keyboard_input()));
+
+        // Clicking away ends editing, so the shortcuts work again.
+        let _ = ctx.run(input(vec![click(egui::pos2(350.0, 250.0), true)]), |c| draw(c, &mut name));
+        let _ = ctx.run(input(vec![click(egui::pos2(350.0, 250.0), false)]), |c| draw(c, &mut name));
+        assert!(
+            shortcuts_live(ctx.wants_keyboard_input()),
+            "clicking away must restore the shortcuts"
+        );
+    }
+
+    #[test]
+    fn shortcuts_blocked_by_modal_and_field() {
+        // The guard must reject every condition that would swallow a keystroke.
+        assert!(listing_shortcuts_live(true, true, false, false, false));
+        assert!(!listing_shortcuts_live(true, true, false, false, true)); // typing
+        assert!(!listing_shortcuts_live(true, true, true, false, false)); // upload prompt
+        assert!(!listing_shortcuts_live(true, true, false, true, false)); // delete prompt
+        assert!(!listing_shortcuts_live(false, true, false, false, false)); // busy
+        assert!(!listing_shortcuts_live(true, false, false, false, false)); // not connected
+    }
 
     #[test]
     fn format_date_renders_packed_dates() {
