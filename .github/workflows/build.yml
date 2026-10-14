@@ -105,30 +105,73 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
-      # Publish the AppImage so it can be downloaded without a GitHub account.
-      # The `latest` prerelease is replaced on every commit to master, giving a
+  windows:
+    name: windows
+    runs-on: windows-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # libusb1-sys vendors libusb's C sources and falls back to building them
+      # when vcpkg/pkg-config find nothing, so no extra setup is needed here.
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Upload exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TI-Nspire-Companion-${{ github.sha }}-x86_64.exe
+          path: target/release/${{ env.BINARY }}.exe
+          if-no-files-found: error
+          retention-days: 90
+
+  release:
+    name: release
+    runs-on: ubuntu-22.04
+    needs: [appimage, windows]
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: TI-Nspire-Companion-*
+          merge-multiple: true
+          path: assets
+
+      # Publish so both files can be downloaded without a GitHub account. The
+      # `latest` prerelease is replaced on every commit to master, giving a
       # stable download URL that always points at the newest build.
       - name: Publish latest release
-        if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          OUTFILE="TI-Nspire-Companion-x86_64.AppImage"
-          ASSET="TI-Nspire-Companion-$(date -u +%Y%m%d)-${GITHUB_SHA:0:7}-x86_64.AppImage"
-          mv "$OUTFILE" "$ASSET"
+          cd assets
+          ls -l
+
+          DATE=$(date -u +%Y%m%d)
+          SHA=$(echo "$GITHUB_SHA" | cut -c1-7)
+          IMG="TI-Nspire-Companion-$DATE-$SHA-x86_64.AppImage"
+          EXE="TI-Nspire-Companion-$DATE-$SHA-x86_64.exe"
+
+          mv ./*.AppImage "$IMG"
+          mv ./*.exe "$EXE"
 
           gh release delete latest --yes --cleanup-tag || true
           gh release create latest \
+            --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "Latest build" \
-            --notes "Automated build of \`${GITHUB_SHA:0:7}\` on \`${GITHUB_REF_NAME}\`.
+            --notes "Automated build of \`$SHA\` on \`$GITHUB_REF_NAME\`.
 
-          Download **$ASSET**, then:
+          Linux (AppImage):
 
           \`\`\`sh
-          chmod +x $ASSET
-          ./$ASSET
-          \`\`\`" \
+          chmod +x $IMG
+          ./$IMG
+          \`\`\`
+
+          Windows: run \`$EXE\`." \
             --prerelease \
-            "$ASSET"
+            "$IMG" "$EXE"
