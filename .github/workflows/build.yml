@@ -133,6 +133,7 @@ jobs:
     needs: [appimage, windows]
     if: github.event_name != 'pull_request'
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           pattern: TI-Nspire-Companion-*
@@ -160,7 +161,6 @@ jobs:
 
           gh release delete latest --yes --cleanup-tag || true
           gh release create latest \
-            --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "Latest build" \
             --notes "Automated build of \`$SHA\` on \`$GITHUB_REF_NAME\`.
